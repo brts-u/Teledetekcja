@@ -1,0 +1,17 @@
+"C:\Users\burb2\Desktop\Pliki Studia\Teledetekcja\grupa_7.tif"
+
+# Wczytanie rastra wielowymiarowego
+GetRasterBand(n)
+np.dstack - stackowanie po dodatkowym wymiarze
+
+## Rozciąganie kontrastu
+znalezienie minimalnej, która nie jest zerem oraz maksymalnej
+(X - min) / (max - min)
+
+# Kompozycja barwna RGB, CIR (GB + IR)
+wizualizacja w matplotlib
+
+# Wskaźnik spektralny (NDVI)
+Analiza na właściwych wartościach wskaźnika
+Wizualizacja w wybranej palecie bazowej
+
