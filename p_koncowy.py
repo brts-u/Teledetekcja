@@ -19,6 +19,13 @@ with rasterio.open(path) as src:
     transform = src.transform
     crs = src.crs
 
+with open(tory_staty.geojson, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+
+
+nir_mean = data['features'][0]['properties']['8nir_mean']
+red_mean = data['features'][0]['properties']['red_mean']
+red_edge_mean = data['features'][0]['properties']['red_edge_mean']
 # Normalizacja
 red /= red.max()
 nir /= nir.max()
