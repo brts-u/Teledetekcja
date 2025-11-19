@@ -1,77 +1,105 @@
 import rasterio
 import numpy as np
+from skimage.io import imread, imsave
 from skimage.filters import gabor
 from skimage.feature import canny
-from skimage.morphology import skeletonize, closing, square
+from skimage.morphology import skeletonize, closing, opening, square
 from skimage.transform import probabilistic_hough_line
 import geopandas as gpd
 from shapely.geometry import LineString
+from json_scraper import *
 
 # ----------------------------
 # 1. Wczytanie obrazu (8 pasm)
 # ----------------------------
-path = r"C:\Users\burb2\Desktop\Pliki Studia\Teledetekcja\grupa_7.tif"
+path = r"C:\Users\burb2\Desktop\Pliki Studia\Teledetekcja\grupa_6.tif"
 
 with rasterio.open(path) as src:
-    red = src.read(6).astype(float)     # pasmo 6
-    nir = src.read(8).astype(float)     # pasmo 8
-    red_edge = src.read(7).astype(float) # opcjonalnie
+    cb = src.read(1).astype(float)  # pasmo coastal_blue
+    b = src.read(2).astype(float)  # pasmo blue
+    gi = src.read(3).astype(float)  # pasmo green_i
+    g = src.read(4).astype(float)  # pasmo green
+    y = src.read(5).astype(float)  # pasmo yellow
+    r = src.read(6).astype(float)  # pasmo red
+    re = src.read(7).astype(float)  # pasmo red_edge
+    nir = src.read(8).astype(float)  # pasmo near_infra_red
     transform = src.transform
     crs = src.crs
 
-with open(tory_staty.geojson, 'r', encoding='utf-8') as f:
-    data = json.load(f)
+# Pomijanie tworzenia maski, jeśli jest już utworzona
+SKIP_BOOLEAN_MASK = False
+
+if not SKIP_BOOLEAN_MASK:
+    # Utwórz raster True/False na podstawie zakresów w arr
+    result_mask = np.ones(cb.shape, dtype=bool)  # Inicjalizacja maski wynikowej
+
+    for band, (min_val, mean_val, max_val) in zip([cb, b, gi, g, y, r, re, nir], arr):
+        max_val *= 1.1
+        result_mask &= (band >= min_val) & (band <= max_val)
+
+    # Zapisz wynikowy raster True/False
+    with rasterio.open('result_mask.tif', 'w', driver='GTiff', height=result_mask.shape[0],
+                       width=result_mask.shape[1], count=1, dtype='uint8', crs=crs, transform=transform) as dst:
+        dst.write(result_mask.astype('uint8'), 1)
+
+img = imread('result_mask.tif', as_gray=True)
+assert img is not None, "file could not be read, check with os.path.exists()"
+kernel = square(2)  # Equivalent to a 2x2 kernel
+opened_img = opening(img, kernel)
+imsave('open_mask.tif', opened_img)
 
 
-nir_mean = data['features'][0]['properties']['8nir_mean']
-red_mean = data['features'][0]['properties']['red_mean']
-red_edge_mean = data['features'][0]['properties']['red_edge_mean']
-# Normalizacja
-red /= red.max()
-nir /= nir.max()
-red_edge /= red_edge.max()
-
-# ----------------------------
-# 2. NDVI + maska niskiej roślinności
-# ----------------------------
-ndvi = (nir - red) / (nir + red + 1e-6)
-low_veg_mask = ndvi < 0.25  # <--- można dostroić (0.20–0.35)
-
-# ----------------------------
-# 3. Wzmocnienie cech liniowych (Gabor)
-# ----------------------------
-gabor_response, _ = gabor(red, frequency=0.2)  # start
-gabor_norm = (gabor_response - gabor_response.min()) / (gabor_response.max() - gabor_response.min())
-
-candidate = gabor_norm * low_veg_mask
-
-# ----------------------------
-# 4. Canny + morfologia
-# ----------------------------
-edges = canny(candidate, sigma=1.5)
-edges_closed = closing(edges, square(3))
-skel = skeletonize(edges_closed)
-
-# ----------------------------
-# 5. Hough transform → linie
-# ----------------------------
-lines = probabilistic_hough_line(
-    skel,
-    threshold=10,
-    line_length=40,  # <--- zmieniać w zależności od regionu
-    line_gap=5
-)
-
-# ----------------------------
-# 6. Wektoryzacja
-# ----------------------------
-geoms = []
-for p0, p1 in lines:
-    (x0, y0) = rasterio.transform.xy(transform, p0[1], p0[0])
-    (x1, y1) = rasterio.transform.xy(transform, p1[1], p1[0])
-    geoms.append(LineString([(x0, y0), (x1, y1)]))
-
-gdf = gpd.GeoDataFrame(geometry=geoms, crs=crs)
-gdf.to_file("torowiska_wykryte.gpkg", driver="GPKG")
-
-print("Zakończono! Wynik zapisano: torowiska_wykryte.shp")
+#
+# # ----------------------------
+# # DALEJ CZAT
+# # ----------------------------
+#
+# # Normalizacja
+# r /= r.max()
+# nir /= nir.max()
+# re /= re.max()
+#
+# # ----------------------------
+# # 2. NDVI + maska niskiej roślinności
+# # ----------------------------
+# ndvi = (nir - r) / (nir + r + 1e-6)
+# low_veg_mask = ndvi < 0.25  # <--- można dostroić (0.20–0.35)
+#
+# # ----------------------------
+# # 3. Wzmocnienie cech liniowych (Gabor)
+# # ----------------------------
+# gabor_response, _ = gabor(r, frequency=0.2)  # start
+# gabor_norm = (gabor_response - gabor_response.min()) / (gabor_response.max() - gabor_response.min())
+#
+# candidate = gabor_norm * low_veg_mask
+#
+# # ----------------------------
+# # 4. Canny + morfologia
+# # ----------------------------
+# edges = canny(candidate, sigma=1.5)
+# edges_closed = closing(edges, square(3))
+# skel = skeletonize(edges_closed)
+#
+# # ----------------------------
+# # 5. Hough transform → linie
+# # ----------------------------
+# lines = probabilistic_hough_line(
+#     skel,
+#     threshold=10,
+#     line_length=40,  # <--- zmieniać w zależności od regionu
+#     line_gap=5
+# )
+#
+# # ----------------------------
+# # 6. Wektoryzacja
+# # ----------------------------
+# geoms = []
+# for p0, p1 in lines:
+#     (x0, y0) = rasterio.transform.xy(transform, p0[1], p0[0])
+#     (x1, y1) = rasterio.transform.xy(transform, p1[1], p1[0])
+#     geoms.append(LineString([(x0, y0), (x1, y1)]))
+#
+# gdf = gpd.GeoDataFrame(geometry=geoms, crs=crs)
+# gdf.to_file("torowiska_wykryte.gpkg", driver="GPKG")
+#
+# print("Zakończono! Wynik zapisano: torowiska_wykryte.shp")
