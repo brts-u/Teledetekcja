@@ -11,6 +11,7 @@ def bbox_range(cluster):
     x_min, x_max = np.where(cols)[0][[0, -1]]
     return x_max - x_min, y_max - y_min
 
+# Aktywować to na rastrze ograniczonym już (w głównym pliku nazwany "complete_mask")
 def keep_long_clusters(binary_image):
     warnings.warn("To trwa bardzo długo! (nie wiem nawet ile bo tego nie odpalałem na całym rastrze)", UserWarning)
     labeled_raster, num_features = label(binary_image)
@@ -25,6 +26,7 @@ def keep_long_clusters(binary_image):
 if __name__ == "__main__":
     import rasterio
 
+    # 'maly_raster' bo na całym mi się strasznie długo robiło...
     with rasterio.open('maly_raster.tif') as src:
         img = src.read(1).astype(bool)  # Read as boolean
         transform = src.transform
