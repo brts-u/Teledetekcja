@@ -1,18 +1,9 @@
-import rasterio
-import numpy as np
 from geopandas import GeoDataFrame
-from skimage.filters import gabor
-from skimage.feature import canny
-from skimage.morphology import skeletonize, closing, opening, square
-from skimage.transform import probabilistic_hough_line
-import geopandas as gpd
+from skimage.morphology import closing, opening, square
 from shapely.geometry import LineString
 
 from clusters import *
 
-# ----------------------------
-# 1. Wczytanie obrazu (8 pasm)
-# ----------------------------
 path = r"C:\Users\burb2\Desktop\Pliki Studia\Teledetekcja\grupa_6.tif"
 
 print("Reading image bands...")
@@ -65,10 +56,6 @@ closed_img = closing(img, kernel3)
 kernel2 = square(2)  # Equivalent to a 2x2 kernel
 opened_img = opening(closed_img, kernel2)
 
-with rasterio.open('complete_mask.tif', 'w', driver='GTiff', height=opened_img.shape[0],
-                   width=opened_img.shape[1], count=1, dtype='uint8', crs=crs, transform=transform) as dst:
-    dst.write(opened_img.astype('uint8'), 1)
-
 labeled_img, num_features = label_with_diagonals(img)
 
 print("Creating clusters...")
@@ -115,7 +102,7 @@ clusters.sort(key=lambda c: c.depth, reverse=True)
 print("Starting vectorization...")
 data = {'geometry': [], 'depth': []}
 for cluster in clusters:
-    # Jeśli depth < 130 to raczej na pewno nie jest to obiekt, który nas obchodzi
+    # Jeśli depth < 130 to prawdopodobnie nie jest to obiekt, który nas obchodzi
     if cluster.depth < 130:
         continue
 

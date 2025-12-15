@@ -1,16 +1,11 @@
 from __future__ import annotations
 
-import os.path
-
-import numpy as np
-from scipy.ndimage import label
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 import time
 import networkx as nx
 import pickle
 import sys
 import rasterio
-
 import numpy as np
 from scipy import ndimage
 
