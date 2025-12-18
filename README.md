@@ -4,18 +4,152 @@
 
 Projekt służy do automatycznego wykrywania i wektoryzacji torów kolejowych na podstawie wielospektralnego obrazu satelitarnego (8 pasm + NDVI).
 
-## Podejście algorytmiczne
+## Struktura projektu
 
-### Założenia
+```
+projekt_3/
+│
+├── 📄 main.py                  # Główny skrypt uruchomieniowy
+├── ⚙️ config.py                # Konfiguracja parametrów (EDYTOWALNY)
+│
+├── 📦 Moduły podstawowe:
+│   ├── clusters.py             # Klasa Cluster i funkcje klasteryzacji
+│   ├── json_scraper.py         # Parsowanie statystyk z GeoJSON
+│   └── io_utils.py             # Narzędzia wejścia/wyjścia (zapis plików)
+│
+├── 🔧 Moduły przetwarzania:
+│   ├── mask_operations.py      # Operacje na maskach spektralnych
+│   ├── path_analysis.py        # Analiza ścieżek (kąty, szerokość, walidacja)
+│   ├── path_connection.py      # Łączenie ścieżek (algorytm Dijkstry)
+│   └── vectorization.py        # Wektoryzacja klastrów do GeoJSON
+│
+├── 📊 Pliki wejściowe:
+│   ├── grupa_6.tif             # Obraz wielospektralny (8 pasm)
+│   └── stats_grupa_6.geojson   # Statystyki spektralne torów kolejowych
+│
+├── 📁 Pliki wyjściowe (generowane):
+│   ├── strict_mask.tif         # Maska wysokiej pewności
+│   ├── result_mask.tif         # Maska po rozszerzaniu
+│   ├── result_mask_connected.tif # Maska po połączeniu segmentów
+│   ├── confidence_map.tif      # Mapa pewności (0-9 pasm)
+│   ├── depths.tif              # Mapa głębokości klastrów
+│   ├── train_tracks_raw.geojson # Surowe wektory torów
+│   └── train_tracks.geojson    # Finalne wektory torów kolejowych
+│
+├── 📝 Dokumentacja:
+│   ├── README.md               # Ten plik
+│   ├── requirements.txt        # Zależności Python
+│   └── instrukcja.txt          # Instrukcja projektu
+│
+├── 🗃️ Inne:
+│   ├── p_koncowy.py            # Stary monolityczny skrypt (archiwum)
+│   ├── venv/                   # Wirtualne środowisko Python (Windows)
+│   └── __pycache__/            # Cache Pythona
+│
+└── 📂 .git/                    # Repozytorium Git
+```
 
-1. **Tory kolejowe są długie** - ciągną się przez cały raster (1-4 główne linie)
-2. **Zajezdnie są na skrajach** - nie w środku rastra, więc nie ma potrzeby ograniczania długości szukania
-3. **Tory nie mają ostrych zakrętów** - minimalny kąt to ~120° (łagodne łuki)
-4. **Tory są wąskie** - grubość 1-15 pikseli (autostrady są grubsze)
+## Instalacja
 
-### Algorytm
+```bash
+pip install -r requirements.txt
+```
 
-#### KROK 1: Pierwsza filtracja (wysokiej pewności)
+## Uruchomienie
+
+```bash
+python main.py
+```
+
+## Konfiguracja
+
+Wszystkie parametry algorytmu znajdują się w pliku `config.py`. Można je edytować bez modyfikacji kodu:
+
+### Ścieżki plików
+
+```python
+INPUT_RASTER_PATH = "sciezka/do/pliku.tif"  # Obraz wejściowy
+STATS_GEOJSON_PATH = "stats_grupa_6.geojson"  # Statystyki spektralne
+```
+
+### Progi filtracji spektralnej
+
+```python
+STRICT_SCALE_MIN = 0.90  # Mnożnik dla min wartości
+STRICT_SCALE_MAX = 1.10  # Mnożnik dla max wartości
+NDVI_MIN_STRICT = 0.21   # Minimalny NDVI
+NDVI_MAX_STRICT = 0.61   # Maksymalny NDVI
+```
+
+### Parametry analizy kątów
+
+```python
+MIN_ANGLE_DEGREES = 120   # Minimalny kąt (tory nie mają ostrych zakrętów)
+ANGLE_SAMPLE_STEP = 5     # Co ile pikseli próbkować kąt
+```
+
+### Parametry szerokości torów
+
+```python
+EXPECTED_TRACK_WIDTH_MIN = 2   # Min. szerokość toru (px)
+EXPECTED_TRACK_WIDTH_MAX = 6   # Max. szerokość (autostrady > 8 px)
+WIDTH_VARIANCE_THRESHOLD = 2.5 # Max. wariancja szerokości
+```
+
+### Parametry wektoryzacji
+
+```python
+MIN_DEPTH_FOR_VECTORIZATION = 130  # Min. głębokość klastra
+MAX_CLUSTER_THICKNESS = 15         # Max. grubość (odrzuca autostrady)
+```
+
+## Moduły
+
+### `config.py`
+Plik konfiguracyjny z wszystkimi parametrami algorytmu. Edytuj ten plik, aby dostosować działanie programu.
+
+### `clusters.py`
+- `Cluster` - klasa reprezentująca klaster pikseli
+- `label_with_diagonals()` - etykietowanie z 8-connectivity
+- `create_clusters()` - tworzenie klastrów z obrazu etykiet
+
+### `io_utils.py`
+- `safe_rasterio_write()` - bezpieczny zapis plików GeoTIFF
+- `safe_geojson_write()` - bezpieczny zapis plików GeoJSON
+- `load_raster_bands()` - wczytywanie pasm rastrowych
+
+### `mask_operations.py`
+- `create_confidence_mask()` - tworzenie maski spektralnej
+- `expand_mask_from_endpoints()` - rozszerzanie maski od krawędzi
+- `extend_track_in_direction()` - rozszerzanie toru w kierunku
+- `extend_all_track_endpoints()` - rozszerzanie wszystkich końców torów
+
+### `path_analysis.py`
+- `calculate_angle()` - obliczanie kąta między punktami
+- `get_direction_vector()` - wektor kierunku ścieżki
+- `check_path_angles()` - sprawdzanie ostrych kątów
+- `analyze_path_width()` - analiza szerokości wzdłuż ścieżki
+- `is_valid_railway_width()` - walidacja szerokości toru
+- `check_parallel_false_positives()` - wykrywanie fałszywych równoległych linii
+
+### `path_connection.py`
+- `find_endpoints()` - znajdowanie punktów końcowych
+- `dijkstra_path_between_endpoints()` - ścieżka Dijkstry
+- `connect_paths_dijkstra()` - łączenie ścieżek algorytmem Dijkstry
+- `find_vectors_in_cone()` - szukanie połączeń w stożku
+- `connect_clusters_with_pixels()` - łączenie klastrów przez piksele
+
+### `vectorization.py`
+- `TrackVectorizer` - klasa do wektoryzacji torów
+  - `load_and_preprocess_mask()` - wczytanie i przetworzenie maski
+  - `create_clusters_with_depth()` - tworzenie klastrów z głębokościami
+  - `filter_and_vectorize()` - filtracja i wektoryzacja
+  - `connect_segments()` - łączenie segmentów
+  - `final_vectorization()` - końcowa wektoryzacja
+
+## Algorytm
+
+### KROK 1: Pierwsza filtracja (wysokiej pewności)
 
 Na podstawie statystyk spektralnych z pliku GeoJSON tworzona jest ścisła maska pikseli:
 
@@ -26,91 +160,39 @@ ORAZ
   NDVI ∈ [0.21, 0.61]
 ```
 
-#### KROK 2: Klasteryzacja i analiza kątów
+### KROK 2: Klasteryzacja i analiza kątów
 
 1. Grupowanie pikseli w klastry (8-connectivity)
 2. Obliczanie **głębokości** (najdłuższa ścieżka przez klaster)
 3. Obliczanie **grubości** (powierzchnia / głębokość)
 4. **Filtracja kątów** - odrzucenie klastrów z kątami < 120°
 
-```python
-# Próbkowanie kątów co 5 pikseli wzdłuż ścieżki
-for i in range(5, len(path) - 5, 5):
-    angle = calculate_angle(path[i-5], path[i], path[i+5])
-    if angle < 120:
-        reject_cluster()
-```
-
-#### KROK 3: Rozszerzanie od końców torów
-
-**Kluczowa innowacja:** Zamiast rozszerzać od wszystkich pikseli:
+### KROK 3: Rozszerzanie od końców torów
 
 1. Znajdź **końce prawidłowych torów**
 2. Oblicz **kierunek przedłużenia** (wektor z ostatnich 10-20 pikseli)
-3. Szukaj następnego piksela:
-   - W stożku ±60° od aktualnego kierunku
-   - Spełniającego progi spektralne (7/9 pasm)
-   - Preferuj piksele "w linii" (najwyższy iloczyn skalarny)
-4. **Bez limitu odległości** - szukaj aż do końca rastra lub braku pasujących pikseli
+3. Szukaj następnego piksela w stożku ±60° od kierunku
+4. **Bez limitu odległości** - szukaj aż do końca rastra
 
-```python
-# Płynna aktualizacja kierunku
-current_dir = 0.7 * new_dir + 0.3 * current_dir  # Wygładzanie
-```
+### KROK 4: Filtrowanie według szerokości
 
-#### KROK 4: Drugie przejście
+Tory kolejowe mają **stałą szerokość** (2-6 pikseli), autostrady są szersze (8+).
 
-Ponowna klasteryzacja i rozszerzanie z bardziej wymagającymi parametrami (8/9 pasm).
+### KROK 5: Wektoryzacja
 
-#### KROK 5: Wektoryzacja
-
-Konwersja klastrów do GeoJSON jako LineString:
-- Minimalna głębokość: 130 pikseli
-- Grubość: 1-15 (odrzuca szum i autostrady)
-
-## Parametry konfiguracyjne
-
-```python
-# Progi spektralne
-STRICT_SCALE_MIN = 0.90
-STRICT_SCALE_MAX = 1.10
-NDVI_MIN = 0.21
-NDVI_MAX = 0.61
-
-# Analiza kątów
-MIN_ANGLE_DEGREES = 120      # Minimalny kąt (tory nie mają ostrych zakrętów)
-MAX_ANGLE_DEVIATION = 60     # Max odchylenie od kierunku przy rozszerzaniu
-ANGLE_SAMPLE_STEP = 5        # Co ile pikseli próbkować kąt
-
-# Rozszerzanie
-EXTENSION_SEARCH_RADIUS = 3  # Promień szukania następnego piksela
-EXTENSION_MAX_DISTANCE = 0   # 0 = bez limitu (szukaj aż do końca rastra)
-EXTENSION_MIN_BANDS = 7      # Min. pasujących pasm (z 9)
-
-# Wektoryzacja
-MIN_DEPTH_FOR_VECTORIZATION = 130
-MAX_CLUSTER_THICKNESS = 15   # Odrzuca autostrady
-MIN_CLUSTER_THICKNESS = 1    # Odrzuca szum
-```
-
-## Pliki wejściowe
-
-- `grupa_6.tif` - wielospektralny obraz satelitarny (8 pasm)
-- `stats_grupa_6.geojson` - statystyki spektralne torów kolejowych
+Konwersja klastrów do GeoJSON jako LineString.
 
 ## Pliki wyjściowe
 
-- `strict_mask.tif` - maska wysokiej pewności (pierwsza filtracja)
-- `result_mask.tif` - finalna maska po rozszerzaniu
-- `confidence_map.tif` - mapa pewności (ile pasm pasuje: 0-9)
-- `depths.tif` - mapa głębokości klastrów
-- `train_tracks.geojson` - zwektoryzowane tory kolejowe
-
-## Uruchomienie
-
-```bash
-python p_koncowy.py
-```
+| Plik | Opis |
+|------|------|
+| `strict_mask.tif` | Maska wysokiej pewności (pierwsza filtracja) |
+| `result_mask.tif` | Finalna maska po rozszerzaniu |
+| `result_mask_connected.tif` | Maska po połączeniu segmentów |
+| `confidence_map.tif` | Mapa pewności (ile pasm pasuje: 0-9) |
+| `depths.tif` | Mapa głębokości klastrów |
+| `train_tracks_raw.geojson` | Surowe zwektoryzowane tory |
+| `train_tracks.geojson` | Finalne zwektoryzowane tory kolejowe |
 
 ## Wymagania
 
@@ -121,18 +203,7 @@ python p_koncowy.py
 - shapely
 - scikit-image
 - scipy
-
-## Struktura projektu
-
-```
-projekt_3/
-├── p_koncowy.py          # Główny skrypt
-├── clusters.py           # Klasy klastrów i funkcje pomocnicze
-├── json_scraper.py       # Parsowanie statystyk z GeoJSON
-├── grupa_6.tif           # Obraz wejściowy
-├── stats_grupa_6.geojson # Statystyki spektralne
-└── README.md             # Dokumentacja
-```
+- networkx
 
 ## Autorzy
 

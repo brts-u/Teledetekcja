@@ -87,6 +87,33 @@ SECOND_PASS_MIN_BANDS_MATCH = 4  # Mniej wymagane pasma (z 9)
 MIN_DEPTH_FOR_VECTORIZATION = 130  # Minimalna głębokość klastra
 MAX_CLUSTER_THICKNESS = 15         # Maksymalna średnia grubość (autostrady są grubsze)
 MIN_CLUSTER_THICKNESS = 1          # Minimalna grubość (szum)
+
+# Parametry szerokości torów (do filtrowania autostrad i fałszywych wykryć)
+EXPECTED_TRACK_WIDTH_MIN = 2       # Minimalna oczekiwana szerokość toru w pikselach
+EXPECTED_TRACK_WIDTH_MAX = 6       # Zmniejszone z 8 - autostrady mają 8+ px
+WIDTH_SAMPLE_STEP = 10             # Co ile pikseli próbkować szerokość
+WIDTH_VARIANCE_THRESHOLD = 2.5     # Zmniejszone z 3.0 - tory mają bardzo stałą szerokość
+MIN_VALID_WIDTH_RATIO = 0.7        # Min. % próbek z prawidłową szerokością
+
+# Parametry wykrywania równoległych fałszywych linii
+PARALLEL_CHECK_DISTANCE = 50       # Dystans do sprawdzenia równoległości
+PARALLEL_ANGLE_THRESHOLD = 15      # Max różnica kąta dla uznania za równoległe (stopnie)
+MIN_DISTANCE_BETWEEN_TRACKS = 20   # Minimalna odległość między dwoma torami (pola to większa odległość)
+
+# Parametry łączenia odcinków (druga wektoryzacja)
+VECTOR_CONNECT_CONE_ANGLE = 45     # Kąt stożka szukania przedłużenia (stopnie)
+VECTOR_CONNECT_MAX_DISTANCE = 150  # Maksymalna odległość szukania połączenia (piksele)
+VECTOR_CONNECT_MIN_BANDS = 5       # Luźniejszy próg dla pikseli łączących (z 9)
+MAX_SHARP_ANGLE_AFTER_CONNECT = 80 # Maksymalny kąt zakrętu po połączeniu (stopnie) - odrzuć jeśli ostrzejszy
+
+# Parametry filtrowania autostrad (bardziej restrykcyjne)
+HIGHWAY_MIN_WIDTH = 8              # Autostrady mają min 8 pikseli szerokości
+HIGHWAY_LOW_VARIANCE = 1.0         # Autostrady mają bardzo stałą szerokość (niską wariancję)
+HIGHWAY_MIN_LENGTH = 200           # Autostrady są długie
+
+# Parametry dla skupisk miejskich
+URBAN_CLUSTER_DENSITY_THRESHOLD = 0.3  # Gęstość pikseli w okolicy (wysoka = miasto)
+URBAN_NEIGHBOR_RADIUS = 50         # Promień sprawdzania gęstości
 # =============================================
 
 print("Reading image bands...")
@@ -820,6 +847,171 @@ clusters = list(clusters.values())
 clusters.sort(key=lambda c: c.depth, reverse=True)
 
 
+def measure_width_at_point(point, direction, cluster_cells_set, max_width=30):
+    """
+    Mierzy szerokość klastra w punkcie prostopadle do kierunku ścieżki.
+    Zwraca szerokość w pikselach.
+    """
+    row, col = point
+    dy, dx = direction
+
+    # Wektor prostopadły
+    perp_dy, perp_dx = -dx, dy
+
+    # Normalizuj
+    length = math.sqrt(perp_dy**2 + perp_dx**2)
+    if length < 1e-6:
+        return 1
+    perp_dy /= length
+    perp_dx /= length
+
+    # Szukaj w obie strony prostopadle do kierunku
+    width = 1  # Sam punkt
+
+    for direction_mult in [1, -1]:
+        for dist in range(1, max_width):
+            nr = int(round(row + direction_mult * dist * perp_dy))
+            nc = int(round(col + direction_mult * dist * perp_dx))
+
+            if (nr, nc) in cluster_cells_set:
+                width += 1
+            else:
+                break
+
+    return width
+
+
+def analyze_path_width(path, cluster_cells, sample_step=10, direction_sample=5):
+    """
+    Analizuje szerokość klastra wzdłuż ścieżki.
+    Zwraca: (średnia_szerokość, wariancja_szerokości, lista_szerokości)
+    """
+    if len(path) < direction_sample * 2 + 1:
+        return 1.0, 0.0, [1]
+
+    cluster_cells_set = set(cluster_cells)
+    widths = []
+
+    for i in range(direction_sample, len(path) - direction_sample, sample_step):
+        # Oblicz lokalny kierunek
+        p_prev = path[i - direction_sample]
+        p_next = path[i + direction_sample]
+
+        dy = p_next[0] - p_prev[0]
+        dx = p_next[1] - p_prev[1]
+
+        length = math.sqrt(dy**2 + dx**2)
+        if length < 1e-6:
+            continue
+
+        direction = (dy / length, dx / length)
+
+        # Zmierz szerokość w tym punkcie
+        width = measure_width_at_point(path[i], direction, cluster_cells_set)
+        widths.append(width)
+
+    if not widths:
+        return 1.0, 0.0, [1]
+
+    avg_width = sum(widths) / len(widths)
+    variance = sum((w - avg_width)**2 for w in widths) / len(widths)
+
+    return avg_width, variance, widths
+
+
+def is_valid_railway_width(cluster, min_width=2, max_width=8, max_variance=3.0, min_valid_ratio=0.7):
+    """
+    Sprawdza czy klaster ma szerokość charakterystyczną dla torów kolejowych.
+    Tory mają stałą szerokość (niską wariancję) w zakresie 2-8 pikseli.
+    Autostrady są szersze (10-20+ pikseli).
+
+    Zwraca: (czy_prawidłowy, średnia_szerokość, wariancja, powód_odrzucenia)
+    """
+    path = cluster.longest_path
+    if path is None or len(path) < 20:
+        return True, 0, 0, None  # Za krótkie do analizy
+
+    avg_width, variance, widths = analyze_path_width(path, cluster.cells)
+
+    # Sprawdź ile próbek ma prawidłową szerokość
+    valid_samples = sum(1 for w in widths if min_width <= w <= max_width)
+    valid_ratio = valid_samples / len(widths) if widths else 0
+
+    # Odrzuć jeśli za szeroki (autostrada)
+    if avg_width > max_width:
+        return False, avg_width, variance, f"za_szeroki ({avg_width:.1f} > {max_width})"
+
+    # Odrzuć jeśli za duża wariancja (niestabilna szerokość - prawdopodobnie nie tor)
+    if variance > max_variance and avg_width > 4:
+        return False, avg_width, variance, f"niestabilna_szerokosc (var={variance:.1f})"
+
+    # Odrzuć jeśli za mało próbek ma prawidłową szerokość
+    if valid_ratio < min_valid_ratio:
+        return False, avg_width, variance, f"za_malo_prawidlowych ({valid_ratio:.1%})"
+
+    return True, avg_width, variance, None
+
+
+def check_parallel_false_positives(clusters_list, min_distance=20, max_angle_diff=15):
+    """
+    Wykrywa pary równoległych klastrów które są blisko siebie -
+    mogą być fałszywymi wykryciami (np. krawędzie pól).
+
+    Zwraca listę klastrów do odrzucenia (krótszy z pary równoległych).
+    """
+    clusters_to_reject = set()
+
+    valid_clusters = [c for c in clusters_list if c.depth >= MIN_DEPTH_FOR_VECTORIZATION
+                      and c.longest_path is not None and len(c.longest_path) >= 20]
+
+    for i, c1 in enumerate(valid_clusters):
+        if id(c1) in clusters_to_reject:
+            continue
+
+        path1 = c1.longest_path
+        # Oblicz kierunek klastra 1
+        dir1 = get_direction_vector(path1, from_end=True, sample_length=min(50, len(path1)//2))
+
+        for c2 in valid_clusters[i+1:]:
+            if id(c2) in clusters_to_reject:
+                continue
+
+            path2 = c2.longest_path
+            # Oblicz kierunek klastra 2
+            dir2 = get_direction_vector(path2, from_end=True, sample_length=min(50, len(path2)//2))
+
+            # Sprawdź czy kierunki są równoległe
+            dot = abs(dir1[0]*dir2[0] + dir1[1]*dir2[1])
+            if dot < math.cos(math.radians(max_angle_diff)):
+                continue  # Nie są równoległe
+
+            # Sprawdź odległość między klastrami
+            min_dist = float('inf')
+            # Próbkuj kilka punktów - osobne indeksy dla każdej ścieżki
+            sample_indices1 = [0, len(path1)//4, len(path1)//2, 3*len(path1)//4, len(path1)-1]
+            sample_indices2 = [0, len(path2)//4, len(path2)//2, 3*len(path2)//4, len(path2)-1]
+            for idx1 in sample_indices1:
+                if idx1 >= len(path1):
+                    continue
+                p1 = path1[idx1]
+                for idx2 in sample_indices2:
+                    if idx2 >= len(path2):
+                        continue
+                    p2 = path2[idx2]
+                    dist = math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+                    min_dist = min(min_dist, dist)
+
+            # Jeśli są blisko i równoległe - to podejrzane
+            if min_dist < min_distance:
+                # Odrzuć krótszy z dwóch
+                if c1.depth < c2.depth:
+                    clusters_to_reject.add(id(c1))
+                else:
+                    clusters_to_reject.add(id(c2))
+
+    return clusters_to_reject
+
+
 def calculate_cluster_thickness(cluster):
     """
     Oblicza średnią grubość klastra jako stosunek powierzchni do długości najdłuższej ścieżki.
@@ -838,16 +1030,33 @@ def calculate_cluster_thickness(cluster):
 # Wektoryzacja
 print("Starting vectorization...")
 print(f"Filtering clusters: depth >= {MIN_DEPTH_FOR_VECTORIZATION}, thickness in [{MIN_CLUSTER_THICKNESS}, {MAX_CLUSTER_THICKNESS}]")
+print(f"Width filter: {EXPECTED_TRACK_WIDTH_MIN}-{EXPECTED_TRACK_WIDTH_MAX} px, max variance {WIDTH_VARIANCE_THRESHOLD}")
 
-data = {'geometry': [], 'depth': [], 'thickness': []}
+# Najpierw wykryj równoległe fałszywe linie (np. krawędzie pól)
+print("Checking for parallel false positives...")
+parallel_rejects = check_parallel_false_positives(
+    clusters,
+    min_distance=MIN_DISTANCE_BETWEEN_TRACKS,
+    max_angle_diff=PARALLEL_ANGLE_THRESHOLD
+)
+print(f"  Oznaczono {len(parallel_rejects)} klastrów jako potencjalne fałszywe (równoległe)")
+
+data = {'geometry': [], 'depth': [], 'thickness': [], 'avg_width': [], 'width_variance': []}
 skipped_thin = 0
 skipped_thick = 0
 skipped_short = 0
+skipped_width = 0
+skipped_parallel = 0
 
 for cluster in clusters:
     # Jeśli depth < MIN_DEPTH to prawdopodobnie nie jest to obiekt, który nas obchodzi
     if cluster.depth < MIN_DEPTH_FOR_VECTORIZATION:
         skipped_short += 1
+        continue
+
+    # Sprawdź czy nie jest w zestawie równoległych fałszywych
+    if id(cluster) in parallel_rejects:
+        skipped_parallel += 1
         continue
 
     # Oblicz grubość klastra
@@ -860,6 +1069,20 @@ for cluster in clusters:
 
     if thickness > MAX_CLUSTER_THICKNESS:
         skipped_thick += 1
+        continue
+
+    # NOWY FILTR: Sprawdź szerokość wzdłuż ścieżki
+    is_valid_width, avg_width, width_var, reject_reason = is_valid_railway_width(
+        cluster,
+        min_width=EXPECTED_TRACK_WIDTH_MIN,
+        max_width=EXPECTED_TRACK_WIDTH_MAX,
+        max_variance=WIDTH_VARIANCE_THRESHOLD,
+        min_valid_ratio=MIN_VALID_WIDTH_RATIO
+    )
+
+    if not is_valid_width:
+        skipped_width += 1
+        print(f"    Odrzucono klaster (depth={cluster.depth}): {reject_reason}")
         continue
 
     full_path = cluster.longest_path
@@ -878,20 +1101,396 @@ for cluster in clusters:
     data['geometry'].append(line)
     data['depth'].append(cluster.depth)
     data['thickness'].append(thickness)
+    data['avg_width'].append(avg_width)
+    data['width_variance'].append(width_var)
 
-print(f"  Pominięto: {skipped_short} za krótkich, {skipped_thin} za cienkich, {skipped_thick} za grubych (autostrady)")
+print(f"  Pominięto: {skipped_short} za krótkich, {skipped_thin} za cienkich, {skipped_thick} za grubych")
+print(f"  Pominięto: {skipped_width} nieprawidłowa szerokość, {skipped_parallel} równoległe fałszywe")
 print(f"  Zachowano: {len(data['geometry'])} klastrów")
 
 gdf = GeoDataFrame(data, crs=crs)
 
-# Bezpieczny zapis GeoJSON
-geojson_path = 'train_tracks.geojson'
+# Bezpieczny zapis GeoJSON (pierwsza wektoryzacja)
+geojson_path = 'train_tracks_raw.geojson'
 try:
     gdf.to_file(geojson_path, driver='GeoJSON')
     print(f"  Zapisano: {geojson_path}")
 except PermissionError:
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    alt_path = f"train_tracks_{timestamp}.geojson"
-    print(f"  Uwaga: Nie można zapisać {geojson_path} (plik zablokowany)")
+    alt_path = f"train_tracks_raw_{timestamp}.geojson"
     print(f"  Zapisuję jako: {alt_path}")
     gdf.to_file(alt_path, driver='GeoJSON')
+
+
+# ============ DRUGA WEKTORYZACJA - ŁĄCZENIE ODCINKÓW ============
+print("\n" + "="*60)
+print("DRUGA WEKTORYZACJA - Łączenie odcinków i filtrowanie")
+print("="*60)
+
+# Zbierz prawidłowe klastry do łączenia
+valid_clusters_for_connection = []
+for cluster in clusters:
+    if cluster.depth < MIN_DEPTH_FOR_VECTORIZATION:
+        continue
+    thickness = calculate_cluster_thickness(cluster)
+    if thickness < MIN_CLUSTER_THICKNESS or thickness > MAX_CLUSTER_THICKNESS:
+        continue
+    is_valid_width, avg_width, width_var, _ = is_valid_railway_width(
+        cluster,
+        min_width=EXPECTED_TRACK_WIDTH_MIN,
+        max_width=EXPECTED_TRACK_WIDTH_MAX,
+        max_variance=WIDTH_VARIANCE_THRESHOLD,
+        min_valid_ratio=MIN_VALID_WIDTH_RATIO
+    )
+    if is_valid_width:
+        valid_clusters_for_connection.append(cluster)
+
+print(f"Klastrów do łączenia: {len(valid_clusters_for_connection)}")
+
+
+def find_vectors_in_cone(endpoint, direction, all_clusters, current_cluster,
+                         cone_angle=45, max_distance=150):
+    """
+    Szuka końców innych wektorów w stożku przed punktem końcowym.
+    Zwraca listę (klaster, punkt_końcowy, odległość, kąt).
+    """
+    candidates = []
+    cone_cos = math.cos(math.radians(cone_angle))
+
+    for cluster in all_clusters:
+        if cluster is current_cluster:
+            continue
+
+        path = cluster.longest_path
+        if path is None or len(path) < 10:
+            continue
+
+        # Sprawdź oba końce ścieżki
+        for end_idx in [0, -1]:
+            other_end = path[end_idx]
+
+            # Oblicz odległość
+            dist = math.sqrt((other_end[0] - endpoint[0])**2 +
+                           (other_end[1] - endpoint[1])**2)
+
+            if dist > max_distance or dist < 5:  # Za daleko lub za blisko
+                continue
+
+            # Oblicz kierunek do drugiego końca
+            dir_to_other = (
+                (other_end[0] - endpoint[0]) / dist,
+                (other_end[1] - endpoint[1]) / dist
+            )
+
+            # Sprawdź czy w stożku (iloczyn skalarny)
+            dot = direction[0] * dir_to_other[0] + direction[1] * dir_to_other[1]
+
+            if dot >= cone_cos:  # W stożku
+                angle = math.degrees(math.acos(max(-1, min(1, dot))))
+                candidates.append((cluster, other_end, dist, angle, end_idx))
+
+    # Sortuj po odległości
+    candidates.sort(key=lambda x: x[2])
+    return candidates
+
+
+def connect_clusters_with_pixels(start_point, end_point, mask, bands, arr, ndvi,
+                                  ndvi_min, ndvi_max, min_bands_match=5):
+    """
+    Próbuje połączyć dwa punkty przez "zdatne" piksele.
+    Używa prostego pathfindingu z luźniejszymi progami.
+    Zwraca listę pikseli łączących lub None jeśli nie udało się połączyć.
+    """
+    height, width = mask.shape
+
+    # Prosty A* lub liniowe przeszukiwanie
+    path = []
+    current = start_point
+    target = end_point
+    visited = {start_point}
+
+    max_steps = int(math.sqrt((end_point[0]-start_point[0])**2 +
+                              (end_point[1]-start_point[1])**2) * 2)
+
+    for _ in range(max_steps):
+        if current == target:
+            return path
+
+        # Znajdź najlepszego sąsiada w kierunku celu
+        best_neighbor = None
+        best_score = float('inf')
+
+        for dr in [-1, 0, 1]:
+            for dc in [-1, 0, 1]:
+                if dr == 0 and dc == 0:
+                    continue
+
+                nr, nc = current[0] + dr, current[1] + dc
+
+                if nr < 0 or nr >= height or nc < 0 or nc >= width:
+                    continue
+                if (nr, nc) in visited:
+                    continue
+
+                # Odległość do celu
+                dist_to_target = math.sqrt((target[0]-nr)**2 + (target[1]-nc)**2)
+
+                # Sprawdź czy piksel jest zdatny (luźniejszy próg)
+                is_valid = check_pixel_threshold(nr, nc, bands, arr, 0.80, 1.20,
+                                                 ndvi, ndvi_min, ndvi_max, min_bands_match)
+
+                # Jeśli już w masce - świetnie
+                if mask[nr, nc]:
+                    score = dist_to_target - 100  # Bonus za bycie w masce
+                elif is_valid:
+                    score = dist_to_target
+                else:
+                    score = dist_to_target + 50  # Kara za niezdatny piksel
+
+                if score < best_score:
+                    best_score = score
+                    best_neighbor = (nr, nc)
+
+        if best_neighbor is None:
+            return None  # Nie udało się
+
+        visited.add(best_neighbor)
+        if not mask[best_neighbor[0], best_neighbor[1]]:
+            path.append(best_neighbor)
+        current = best_neighbor
+
+        # Sprawdź czy blisko celu
+        if math.sqrt((target[0]-current[0])**2 + (target[1]-current[1])**2) < 3:
+            return path
+
+    return None
+
+
+def check_connection_angle(cluster1, end_idx1, cluster2, end_idx2, max_angle=80):
+    """
+    Sprawdza czy połączenie dwóch klastrów nie tworzy zbyt ostrego kąta.
+    Zwraca True jeśli kąt jest akceptowalny.
+    """
+    path1 = cluster1.longest_path
+    path2 = cluster2.longest_path
+
+    # Oblicz kierunek na końcu klastra 1
+    sample_len = min(20, len(path1)//4)
+    if end_idx1 == 0:
+        dir1 = get_direction_vector(path1, from_end=False, sample_length=sample_len)
+    else:
+        dir1 = get_direction_vector(path1, from_end=True, sample_length=sample_len)
+
+    # Oblicz kierunek na początku klastra 2 (w kierunku połączenia)
+    sample_len = min(20, len(path2)//4)
+    if end_idx2 == 0:
+        # Kierunek wchodzący do klastra 2 (odwrotny)
+        dir2_raw = get_direction_vector(path2, from_end=False, sample_length=sample_len)
+        dir2 = (-dir2_raw[0], -dir2_raw[1])
+    else:
+        dir2_raw = get_direction_vector(path2, from_end=True, sample_length=sample_len)
+        dir2 = (-dir2_raw[0], -dir2_raw[1])
+
+    # Oblicz kąt między kierunkami
+    dot = dir1[0]*dir2[0] + dir1[1]*dir2[1]
+    dot = max(-1, min(1, dot))
+    angle = math.degrees(math.acos(dot))
+
+    # Kąt 0 = ta sama linia prosta, kąt 180 = zawracanie
+    # Chcemy odrzucić zakręty > 80 stopni, czyli kąt < 100 stopni
+    return angle >= (180 - max_angle), angle
+
+
+# Łączenie klastrów
+print("Szukanie połączeń między odcinkami...")
+from json_scraper import arr
+
+connections_made = 0
+connected_pairs = set()  # Aby nie łączyć tych samych dwukrotnie
+new_mask = result_mask.copy()
+
+for cluster in valid_clusters_for_connection:
+    path = cluster.longest_path
+    if path is None or len(path) < 20:
+        continue
+
+    # Sprawdź oba końce
+    for end_idx in [0, -1]:
+        endpoint = path[end_idx]
+
+        # Oblicz kierunek na tym końcu
+        sample_len = min(20, len(path)//4)
+        if end_idx == 0:
+            direction = get_direction_vector(path, from_end=False, sample_length=sample_len)
+        else:
+            direction = get_direction_vector(path, from_end=True, sample_length=sample_len)
+
+        if direction == (0, 0):
+            continue
+
+        # Szukaj kandydatów w stożku
+        candidates = find_vectors_in_cone(
+            endpoint, direction, valid_clusters_for_connection, cluster,
+            cone_angle=VECTOR_CONNECT_CONE_ANGLE,
+            max_distance=VECTOR_CONNECT_MAX_DISTANCE
+        )
+
+        for other_cluster, other_end, dist, angle, other_end_idx in candidates:
+            # Sprawdź czy już połączone
+            pair_key = tuple(sorted([id(cluster), id(other_cluster)]))
+            if pair_key in connected_pairs:
+                continue
+
+            # Sprawdź kąt połączenia
+            angle_ok, connection_angle = check_connection_angle(
+                cluster, end_idx, other_cluster, other_end_idx,
+                max_angle=MAX_SHARP_ANGLE_AFTER_CONNECT
+            )
+
+            if not angle_ok:
+                continue
+
+            # Próbuj połączyć przez piksele
+            connecting_pixels = connect_clusters_with_pixels(
+                endpoint, other_end, new_mask, all_bands, arr, ndvi,
+                NDVI_MIN_LOOSE, NDVI_MAX_LOOSE,
+                min_bands_match=VECTOR_CONNECT_MIN_BANDS
+            )
+
+            if connecting_pixels is not None:
+                # Dodaj piksele do maski
+                for r, c in connecting_pixels:
+                    new_mask[r, c] = True
+
+                connected_pairs.add(pair_key)
+                connections_made += 1
+                print(f"  Połączono: depth {cluster.depth} <-> {other_cluster.depth}, "
+                      f"dist={dist:.0f}, angle={connection_angle:.1f}°, "
+                      f"nowe piksele={len(connecting_pixels)}")
+                break  # Jeden koniec - jedno połączenie
+
+print(f"Utworzono {connections_made} połączeń")
+
+# Zapisz zaktualizowaną maskę
+safe_rasterio_write('result_mask_connected.tif', new_mask.astype('uint8'),
+                    new_mask.shape[0], new_mask.shape[1], crs, transform)
+
+
+# ============ TRZECIA WEKTORYZACJA - FINALNA ============
+print("\n" + "="*60)
+print("TRZECIA WEKTORYZACJA - Finalna z filtrowaniem zakrętów")
+print("="*60)
+
+# Ponowna klasteryzacja na połączonej masce
+labeled_final, num_final = label_with_diagonals(new_mask)
+final_clusters = create_clusters(labeled_final)
+print(f"Klastrów po połączeniu: {len(final_clusters)}")
+
+# Oblicz głębokości
+for cluster in final_clusters.values():
+    if cluster.size() >= 50:
+        cluster.get_depth()
+
+
+def check_path_has_sharp_turns(path, max_angle=80, sample_step=10):
+    """
+    Sprawdza czy ścieżka ma ostre zakręty (> max_angle stopni).
+    Zwraca (ma_ostre_zakręty, lista_kątów).
+    """
+    if len(path) < sample_step * 2 + 1:
+        return False, []
+
+    angles = []
+    has_sharp = False
+
+    for i in range(sample_step, len(path) - sample_step, sample_step):
+        p1 = path[i - sample_step]
+        p2 = path[i]
+        p3 = path[i + sample_step]
+
+        angle = calculate_angle(p1, p2, p3)
+        angles.append(angle)
+
+        # Kąt < (180 - max_angle) oznacza zakręt > max_angle stopni
+        if angle < (180 - max_angle):
+            has_sharp = True
+
+    return has_sharp, angles
+
+
+# Wektoryzacja finalna z filtrowaniem zakrętów
+final_data = {'geometry': [], 'depth': [], 'thickness': [], 'avg_width': []}
+skipped_sharp_turns = 0
+skipped_highway = 0
+
+final_clusters_list = list(final_clusters.values())
+final_clusters_list.sort(key=lambda c: c.depth, reverse=True)
+
+for cluster in final_clusters_list:
+    if cluster.depth < MIN_DEPTH_FOR_VECTORIZATION:
+        continue
+
+    thickness = calculate_cluster_thickness(cluster)
+    if thickness < MIN_CLUSTER_THICKNESS or thickness > MAX_CLUSTER_THICKNESS:
+        continue
+
+    # Sprawdź szerokość
+    is_valid_width, avg_width, width_var, reject_reason = is_valid_railway_width(
+        cluster,
+        min_width=EXPECTED_TRACK_WIDTH_MIN,
+        max_width=EXPECTED_TRACK_WIDTH_MAX,
+        max_variance=WIDTH_VARIANCE_THRESHOLD,
+        min_valid_ratio=MIN_VALID_WIDTH_RATIO
+    )
+
+    if not is_valid_width:
+        # Sprawdź czy to autostrada (szeroka, stała szerokość, długa)
+        if avg_width >= HIGHWAY_MIN_WIDTH and width_var <= HIGHWAY_LOW_VARIANCE and cluster.depth >= HIGHWAY_MIN_LENGTH:
+            skipped_highway += 1
+            print(f"  Odrzucono autostradę: depth={cluster.depth}, width={avg_width:.1f}, var={width_var:.2f}")
+        continue
+
+    # NOWY FILTR: Sprawdź ostre zakręty
+    path = cluster.longest_path
+    if path is not None and len(path) >= 30:
+        has_sharp, angles = check_path_has_sharp_turns(path, max_angle=MAX_SHARP_ANGLE_AFTER_CONNECT)
+        if has_sharp:
+            min_angle = min(angles) if angles else 180
+            skipped_sharp_turns += 1
+            print(f"  Odrzucono (ostry zakręt): depth={cluster.depth}, min_angle={min_angle:.1f}°")
+            continue
+
+    full_path = cluster.longest_path
+    steps = full_path[::10]
+    geo_coords = []
+    for row, col in steps:
+        x, y = transform * (col, row)
+        geo_coords.append((x, y))
+
+    line = LineString(geo_coords)
+    final_data['geometry'].append(line)
+    final_data['depth'].append(cluster.depth)
+    final_data['thickness'].append(thickness)
+    final_data['avg_width'].append(avg_width)
+
+print(f"\nStatystyki końcowe:")
+print(f"  Odrzucono: {skipped_sharp_turns} z ostrymi zakrętami, {skipped_highway} autostrad")
+print(f"  Zachowano: {len(final_data['geometry'])} tras kolejowych")
+
+final_gdf = GeoDataFrame(final_data, crs=crs)
+
+# Bezpieczny zapis końcowego GeoJSON
+final_geojson_path = 'train_tracks.geojson'
+try:
+    final_gdf.to_file(final_geojson_path, driver='GeoJSON')
+    print(f"  Zapisano: {final_geojson_path}")
+except PermissionError:
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    alt_path = f"train_tracks_{timestamp}.geojson"
+    print(f"  Zapisuję jako: {alt_path}")
+    final_gdf.to_file(alt_path, driver='GeoJSON')
+
+print("\n" + "="*60)
+print("ZAKOŃCZONO")
+print("="*60)
+
