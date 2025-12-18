@@ -4,7 +4,7 @@ import shapely
 import numpy as np
 import matplotlib.pyplot as plt
 
-path = r"C:\Users\burb2\Desktop\Pliki Studia\Teledetekcja\grupa_7.tif"
+path = r"C:\Users\User\OneDrive - Politechnika Warszawska\3 rok\Teledetekcja\projekt_3\grupa_6.tif"
 
 gdal.UseExceptions()
 
